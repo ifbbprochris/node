@@ -60,6 +60,8 @@
       "<(V8_ROOT)/src/builtins/proxy.tq",
       "<(V8_ROOT)/src/builtins/reflect.tq",
       "<(V8_ROOT)/src/builtins/regexp-replace.tq",
+      "<(V8_ROOT)/src/builtins/regexp-source.tq",
+      "<(V8_ROOT)/src/builtins/regexp-test.tq",
       "<(V8_ROOT)/src/builtins/regexp.tq",
       "<(V8_ROOT)/src/builtins/string.tq",
       "<(V8_ROOT)/src/builtins/string-endswith.tq",

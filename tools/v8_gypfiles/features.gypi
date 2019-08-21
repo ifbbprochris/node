@@ -181,7 +181,7 @@
     # Enable minor mark compact.
     'v8_enable_minor_mc%': 1,
 
-    # Enables lazy source positions by default.
+    # Enable lazy source positions by default.
     'v8_enable_lazy_source_positions%': 1,
 
     # Disable write barriers when GCs are non-incremental and
