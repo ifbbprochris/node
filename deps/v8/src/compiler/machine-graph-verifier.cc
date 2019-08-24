@@ -60,8 +60,7 @@ class MachineRepresentationInferrer {
         CHECK_LE(index, static_cast<size_t>(1));
         return index == 0 ? MachineRepresentation::kWord64
                           : MachineRepresentation::kBit;
-      case IrOpcode::kCall:
-      case IrOpcode::kCallWithCallerSavedRegisters: {
+      case IrOpcode::kCall: {
         auto call_descriptor = CallDescriptorOf(input->op());
         return call_descriptor->GetReturnType(index).representation();
       }
@@ -128,7 +127,6 @@ class MachineRepresentationInferrer {
             representation_vector_[node->id()] = PromoteRepresentation(
                 LoadRepresentationOf(node->op()).representation());
             break;
-          case IrOpcode::kLoadStackPointer:
           case IrOpcode::kLoadFramePointer:
           case IrOpcode::kLoadParentFramePointer:
             representation_vector_[node->id()] =
@@ -142,8 +140,7 @@ class MachineRepresentationInferrer {
             representation_vector_[node->id()] =
                 PhiRepresentationOf(node->op());
             break;
-          case IrOpcode::kCall:
-          case IrOpcode::kCallWithCallerSavedRegisters: {
+          case IrOpcode::kCall: {
             auto call_descriptor = CallDescriptorOf(node->op());
             if (call_descriptor->ReturnCount() > 0) {
               representation_vector_[node->id()] =
@@ -248,6 +245,13 @@ class MachineRepresentationInferrer {
             representation_vector_[node->id()] =
                 MachineRepresentation::kTaggedSigned;
             break;
+          case IrOpcode::kBitcastWord32ToCompressedSigned:
+            representation_vector_[node->id()] =
+                MachineRepresentation::kCompressedSigned;
+            break;
+          case IrOpcode::kBitcastCompressedSignedToWord32:
+            representation_vector_[node->id()] = MachineRepresentation::kWord32;
+            break;
           case IrOpcode::kWord32Equal:
           case IrOpcode::kInt32LessThan:
           case IrOpcode::kInt32LessThanOrEqual:
@@ -265,6 +269,7 @@ class MachineRepresentationInferrer {
           case IrOpcode::kFloat64LessThan:
           case IrOpcode::kFloat64LessThanOrEqual:
           case IrOpcode::kChangeTaggedToBit:
+          case IrOpcode::kStackPointerGreaterThan:
             representation_vector_[node->id()] = MachineRepresentation::kBit;
             break;
 #define LABEL(opcode) case IrOpcode::k##opcode:
@@ -373,7 +378,6 @@ class MachineRepresentationChecker {
         }
         switch (node->opcode()) {
           case IrOpcode::kCall:
-          case IrOpcode::kCallWithCallerSavedRegisters:
           case IrOpcode::kTailCall:
             CheckCallInputs(node);
             break;
@@ -433,6 +437,13 @@ class MachineRepresentationChecker {
           case IrOpcode::kTaggedPoisonOnSpeculation:
             CheckValueInputIsTagged(node, 0);
             break;
+          case IrOpcode::kBitcastWord32ToCompressedSigned:
+            CheckValueInputRepresentationIs(node, 0,
+                                            MachineRepresentation::kWord32);
+            break;
+          case IrOpcode::kBitcastCompressedSignedToWord32:
+            CheckValueInputIsCompressed(node, 0);
+            break;
           case IrOpcode::kTruncateFloat64ToWord32:
           case IrOpcode::kTruncateFloat64ToUint32:
           case IrOpcode::kTruncateFloat64ToFloat32:
@@ -447,8 +458,13 @@ class MachineRepresentationChecker {
             break;
           case IrOpcode::kWord64Equal:
             if (Is64()) {
-              CheckValueInputIsTaggedOrPointer(node, 0);
-              CheckValueInputIsTaggedOrPointer(node, 1);
+              if (COMPRESS_POINTERS_BOOL) {
+                CheckValueInputForInt64Op(node, 0);
+                CheckValueInputForInt64Op(node, 1);
+              } else {
+                CheckValueInputIsTaggedOrPointer(node, 0);
+                CheckValueInputIsTaggedOrPointer(node, 1);
+              }
               if (!is_stub_) {
                 CheckValueInputRepresentationIs(
                     node, 1, inferrer_->GetRepresentation(node->InputAt(0)));
@@ -699,6 +715,10 @@ class MachineRepresentationChecker {
             }
             break;
           }
+          case IrOpcode::kStackPointerGreaterThan:
+            CheckValueInputRepresentationIs(
+                node, 0, MachineType::PointerRepresentation());
+            break;
           case IrOpcode::kThrow:
           case IrOpcode::kTypedStateValues:
           case IrOpcode::kFrameState:

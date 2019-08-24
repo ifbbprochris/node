@@ -189,16 +189,18 @@ compiler::TNode<JSObject> ConstructorBuiltinsAssembler::EmitFastNewObject(
   BIND(&fast);
 
   // Load the initial map and verify that it's in fact a map.
-  Node* initial_map =
+  TNode<Object> initial_map_or_proto =
       LoadObjectField(new_target, JSFunction::kPrototypeOrInitialMapOffset);
-  GotoIf(TaggedIsSmi(initial_map), call_runtime);
-  GotoIf(DoesntHaveInstanceType(initial_map, MAP_TYPE), call_runtime);
+  GotoIf(TaggedIsSmi(initial_map_or_proto), call_runtime);
+  GotoIf(DoesntHaveInstanceType(CAST(initial_map_or_proto), MAP_TYPE),
+         call_runtime);
+  TNode<Map> initial_map = CAST(initial_map_or_proto);
 
   // Fall back to runtime if the target differs from the new target's
   // initial map constructor.
-  Node* new_target_constructor =
+  TNode<Object> new_target_constructor =
       LoadObjectField(initial_map, Map::kConstructorOrBackPointerOffset);
-  GotoIf(WordNotEqual(target, new_target_constructor), call_runtime);
+  GotoIf(TaggedNotEqual(target, new_target_constructor), call_runtime);
 
   VARIABLE(properties, MachineRepresentation::kTagged);
 
@@ -520,26 +522,28 @@ Node* ConstructorBuiltinsAssembler::EmitCreateShallowObjectLiteral(
     // Copy over in-object properties.
     Label continue_with_write_barrier(this), done_init(this);
     TVARIABLE(IntPtrT, offset, IntPtrConstant(JSObject::kHeaderSize));
-    // Mutable heap numbers only occur on 32-bit platforms.
+    // Heap numbers are only mutable on 32-bit platforms.
     bool may_use_mutable_heap_numbers = !FLAG_unbox_double_fields;
     {
       Comment("Copy in-object properties fast");
       Label continue_fast(this, &offset);
-      Branch(WordEqual(offset.value(), instance_size), &done_init,
+      Branch(IntPtrEqual(offset.value(), instance_size), &done_init,
              &continue_fast);
       BIND(&continue_fast);
       if (may_use_mutable_heap_numbers) {
         TNode<Object> field = LoadObjectField(boilerplate, offset.value());
         Label store_field(this);
         GotoIf(TaggedIsSmi(field), &store_field);
-        GotoIf(IsMutableHeapNumber(CAST(field)), &continue_with_write_barrier);
+        // TODO(leszeks): Read the field descriptor to decide if this heap
+        // number is mutable or not.
+        GotoIf(IsHeapNumber(CAST(field)), &continue_with_write_barrier);
         Goto(&store_field);
         BIND(&store_field);
         StoreObjectFieldNoWriteBarrier(copy, offset.value(), field);
       } else {
         // Copy fields as raw data.
-        TNode<IntPtrT> field =
-            LoadObjectField<IntPtrT>(boilerplate, offset.value());
+        TNode<TaggedT> field =
+            LoadObjectField<TaggedT>(boilerplate, offset.value());
         StoreObjectFieldNoWriteBarrier(copy, offset.value(), field);
       }
       offset = IntPtrAdd(offset.value(), IntPtrConstant(kTaggedSize));
@@ -571,18 +575,17 @@ Node* ConstructorBuiltinsAssembler::EmitCreateShallowObjectLiteral(
           offset.value(), instance_size,
           [=](Node* offset) {
             Node* field = LoadObjectField(copy, offset);
-            Label copy_mutable_heap_number(this, Label::kDeferred),
-                continue_loop(this);
+            Label copy_heap_number(this, Label::kDeferred), continue_loop(this);
             // We only have to clone complex field values.
             GotoIf(TaggedIsSmi(field), &continue_loop);
-            Branch(IsMutableHeapNumber(field), &copy_mutable_heap_number,
-                   &continue_loop);
-            BIND(&copy_mutable_heap_number);
+            // TODO(leszeks): Read the field descriptor to decide if this heap
+            // number is mutable or not.
+            Branch(IsHeapNumber(field), &copy_heap_number, &continue_loop);
+            BIND(&copy_heap_number);
             {
               Node* double_value = LoadHeapNumberValue(field);
-              Node* mutable_heap_number =
-                  AllocateMutableHeapNumberWithValue(double_value);
-              StoreObjectField(copy, offset, mutable_heap_number);
+              Node* heap_number = AllocateHeapNumberWithValue(double_value);
+              StoreObjectField(copy, offset, heap_number);
               Goto(&continue_loop);
             }
             BIND(&continue_loop);
@@ -638,14 +641,14 @@ TF_BUILTIN(ObjectConstructor, ConstructorBuiltinsAssembler) {
       ChangeInt32ToIntPtr(Parameter(Descriptor::kJSActualArgumentsCount));
   CodeStubArguments args(this, argc);
   Node* context = Parameter(Descriptor::kContext);
-  Node* new_target = Parameter(Descriptor::kJSNewTarget);
+  TNode<Object> new_target = CAST(Parameter(Descriptor::kJSNewTarget));
 
   VARIABLE(var_result, MachineRepresentation::kTagged);
   Label if_subclass(this, Label::kDeferred), if_notsubclass(this),
       return_result(this);
   GotoIf(IsUndefined(new_target), &if_notsubclass);
   TNode<JSFunction> target = CAST(Parameter(Descriptor::kJSTarget));
-  Branch(WordEqual(new_target, target), &if_notsubclass, &if_subclass);
+  Branch(TaggedEqual(new_target, target), &if_notsubclass, &if_subclass);
 
   BIND(&if_subclass);
   {
@@ -687,14 +690,14 @@ TF_BUILTIN(ObjectConstructor, ConstructorBuiltinsAssembler) {
 // ES #sec-number-constructor
 TF_BUILTIN(NumberConstructor, ConstructorBuiltinsAssembler) {
   Node* context = Parameter(Descriptor::kContext);
-  Node* argc =
+  TNode<WordT> argc =
       ChangeInt32ToIntPtr(Parameter(Descriptor::kJSActualArgumentsCount));
   CodeStubArguments args(this, argc);
 
   // 1. If no arguments were passed to this function invocation, let n be +0.
   VARIABLE(var_n, MachineRepresentation::kTagged, SmiConstant(0));
   Label if_nloaded(this, &var_n);
-  GotoIf(WordEqual(argc, IntPtrConstant(0)), &if_nloaded);
+  GotoIf(IntPtrEqual(argc, IntPtrConstant(0)), &if_nloaded);
 
   // 2. Else,
   //    a. Let prim be ? ToNumeric(value).
@@ -737,67 +740,6 @@ TF_BUILTIN(NumberConstructor, ConstructorBuiltinsAssembler) {
 TF_BUILTIN(GenericLazyDeoptContinuation, ConstructorBuiltinsAssembler) {
   Node* result = Parameter(Descriptor::kResult);
   Return(result);
-}
-
-// https://tc39.github.io/ecma262/#sec-string-constructor
-TF_BUILTIN(StringConstructor, ConstructorBuiltinsAssembler) {
-  Node* context = Parameter(Descriptor::kContext);
-  Node* argc =
-      ChangeInt32ToIntPtr(Parameter(Descriptor::kJSActualArgumentsCount));
-  CodeStubArguments args(this, argc);
-
-  TNode<Object> new_target = CAST(Parameter(Descriptor::kJSNewTarget));
-
-  // 1. If no arguments were passed to this function invocation, let s be "".
-  VARIABLE(var_s, MachineRepresentation::kTagged, EmptyStringConstant());
-  Label if_sloaded(this, &var_s);
-  GotoIf(WordEqual(argc, IntPtrConstant(0)), &if_sloaded);
-
-  // 2. Else,
-  //    a. If NewTarget is undefined [...]
-  Node* value = args.AtIndex(0);
-  Label if_tostring(this, &var_s);
-  GotoIfNot(IsUndefined(new_target), &if_tostring);
-
-  // 2a. [...] and Type(value) is Symbol, return SymbolDescriptiveString(value).
-  GotoIf(TaggedIsSmi(value), &if_tostring);
-  GotoIfNot(IsSymbol(value), &if_tostring);
-  {
-    Node* result =
-        CallRuntime(Runtime::kSymbolDescriptiveString, context, value);
-    args.PopAndReturn(result);
-  }
-
-  // 2b. Let s be ? ToString(value).
-  BIND(&if_tostring);
-  {
-    var_s.Bind(CallBuiltin(Builtins::kToString, context, value));
-    Goto(&if_sloaded);
-  }
-
-  // 3. If NewTarget is undefined, return s.
-  BIND(&if_sloaded);
-  {
-    Node* s_value = var_s.value();
-    Label return_s(this), constructstring(this, Label::kDeferred);
-    Branch(IsUndefined(new_target), &return_s, &constructstring);
-
-    BIND(&return_s);
-    { args.PopAndReturn(s_value); }
-
-    BIND(&constructstring);
-    {
-      // We are not using Parameter(Descriptor::kJSTarget) and loading the value
-      // from the current frame here in order to reduce register pressure on the
-      // fast path.
-      TNode<JSFunction> target = LoadTargetFromFrame();
-
-      Node* result =
-          CallBuiltin(Builtins::kFastNewObject, context, target, new_target);
-      StoreObjectField(result, JSPrimitiveWrapper::kValueOffset, s_value);
-      args.PopAndReturn(result);
-    }
-  }
 }
 
 }  // namespace internal

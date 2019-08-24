@@ -56,6 +56,8 @@ type uint16 extends uint31
 type int8 extends int16 generates 'TNode<Int8T>' constexpr 'int8_t';
 type uint8 extends uint16
     generates 'TNode<Uint8T>' constexpr 'uint8_t';
+type char8 extends int8 constexpr 'char';
+type char16 extends uint16 constexpr 'char16_t';
 type int64 generates 'TNode<Int64T>' constexpr 'int64_t';
 type intptr generates 'TNode<IntPtrT>' constexpr 'intptr_t';
 type uintptr generates 'TNode<UintPtrT>' constexpr 'uintptr_t';
@@ -136,9 +138,11 @@ extern class SeqString extends String {
 }
 @generateCppClass
 extern class SeqOneByteString extends SeqString {
+  chars[length]: char8;
 }
 @generateCppClass
 extern class SeqTwoByteString extends SeqString {
+  chars[length]: char16;
 }
 
 @generateCppClass
@@ -205,7 +209,7 @@ type LayoutDescriptor extends ByteArray
 type TransitionArray extends WeakFixedArray
     generates 'TNode<TransitionArray>';
 
-type InstanceType extends uint16 constexpr 'InstanceType';
+type InstanceType extends uint16 constexpr 'v8::internal::InstanceType';
 
 extern class Map extends HeapObject {
   instance_size_in_words: uint8;
@@ -925,6 +929,7 @@ extern class StackFrameInfo extends Struct {
   type_name: String | Null | Undefined;
   eval_origin: String | Null | Undefined;
   wasm_module_name: String | Null | Undefined;
+  wasm_instance: WasmInstanceObject | Null | Undefined;
   flag: Smi;
 }
 
@@ -990,6 +995,8 @@ extern class WasmDebugInfo extends Struct {
 }
 
 extern class WasmExceptionTag extends Struct { index: Smi; }
+
+const kTaggedSize: constexpr int31 generates 'kTaggedSize';
 
 const kSmiTagSize: constexpr int31 generates 'kSmiTagSize';
 const V8_INFINITY: constexpr float64 generates 'V8_INFINITY';
@@ -1180,6 +1187,7 @@ extern macro Int32FalseConstant(): bool;
 extern macro EmptyStringConstant(): EmptyString;
 extern macro LengthStringConstant(): String;
 extern macro NanConstant(): NaN;
+extern macro IteratorSymbolConstant(): Symbol;
 
 const TheHole: TheHole = TheHoleConstant();
 const Null: Null = NullConstant();
@@ -1486,6 +1494,7 @@ extern transitioning builtin HasProperty(implicit context: Context)(
     Object, Object): Boolean;
 extern transitioning macro HasProperty_Inline(implicit context: Context)(
     JSReceiver, Object): Boolean;
+extern builtin LoadIC(Context, Object, Object, Smi, FeedbackVector): Object;
 
 extern macro ThrowRangeError(implicit context: Context)(
     constexpr MessageTemplate): never;
@@ -1540,6 +1549,8 @@ transitioning builtin ToString(context: Context, o: Object): String {
 }
 extern transitioning runtime ToStringRT(Context, Object): String;
 extern transitioning builtin NonPrimitiveToPrimitive_String(
+    Context, Object): Object;
+extern transitioning builtin NonPrimitiveToPrimitive_Default(
     Context, Object): Object;
 
 extern transitioning runtime NormalizeElements(Context, JSObject);
@@ -1632,38 +1643,51 @@ extern operator '<' macro Float64LessThan(float64, float64): bool;
 extern macro BranchIfNumberEqual(Number, Number): never
     labels Taken, NotTaken;
 operator '==' macro IsNumberEqual(a: Number, b: Number): bool {
-  return (BranchIfNumberEqual(a, b)) ? true : false;
+  BranchIfNumberEqual(a, b) otherwise return true, return false;
 }
 operator '!=' macro IsNumberNotEqual(a: Number, b: Number): bool {
-  return (BranchIfNumberEqual(a, b)) ? false : true;
+  return !(a == b);
 }
-extern operator '<' macro BranchIfNumberLessThan(Number, Number): never
+extern macro BranchIfNumberLessThan(Number, Number): never
     labels Taken, NotTaken;
-extern operator '<=' macro BranchIfNumberLessThanOrEqual(Number, Number): never
+operator '<' macro NumberIsLessThan(a: Number, b: Number): bool {
+  BranchIfNumberLessThan(a, b) otherwise return true, return false;
+}
+extern macro BranchIfNumberLessThanOrEqual(Number, Number): never
     labels Taken, NotTaken;
+operator '<=' macro NumberIsLessThanOrEqual(a: Number, b: Number): bool {
+  BranchIfNumberLessThanOrEqual(a, b) otherwise return true, return false;
+}
 
-extern operator '>' macro BranchIfNumberGreaterThan(Number, Number): never
-    labels Taken, NotTaken;
-extern operator '>=' macro BranchIfNumberGreaterThanOrEqual(
-    Number, Number): never
-    labels Taken, NotTaken;
+operator '>' macro NumberIsGreaterThan(a: Number, b: Number): bool {
+  return b < a;
+}
+operator '>=' macro NumberIsGreaterThanOrEqual(a: Number, b: Number): bool {
+  return b <= a;
+}
 
-// The type of all tagged values that can safely be compared with WordEqual.
+extern macro BranchIfFloat64IsNaN(float64): never
+    labels Taken, NotTaken;
+macro Float64IsNaN(n: float64): bool {
+  BranchIfFloat64IsNaN(n) otherwise return true, return false;
+}
+
+// The type of all tagged values that can safely be compared with TaggedEqual.
 type TaggedWithIdentity =
     JSReceiver | FixedArrayBase | Oddball | Map | EmptyString;
 
-extern operator '==' macro WordEqual(TaggedWithIdentity, Object): bool;
-extern operator '==' macro WordEqual(Object, TaggedWithIdentity): bool;
-extern operator '==' macro WordEqual(
+extern operator '==' macro TaggedEqual(TaggedWithIdentity, Object): bool;
+extern operator '==' macro TaggedEqual(Object, TaggedWithIdentity): bool;
+extern operator '==' macro TaggedEqual(
     TaggedWithIdentity, TaggedWithIdentity): bool;
-extern operator '!=' macro WordNotEqual(TaggedWithIdentity, Object): bool;
-extern operator '!=' macro WordNotEqual(Object, TaggedWithIdentity): bool;
-extern operator '!=' macro WordNotEqual(
+extern operator '!=' macro TaggedNotEqual(TaggedWithIdentity, Object): bool;
+extern operator '!=' macro TaggedNotEqual(Object, TaggedWithIdentity): bool;
+extern operator '!=' macro TaggedNotEqual(
     TaggedWithIdentity, TaggedWithIdentity): bool;
 // Do not overload == and != if it is unclear if object identity is the right
 // equality.
-extern macro WordEqual(Object, Object): bool;
-extern macro WordNotEqual(Object, Object): bool;
+extern macro TaggedEqual(Object, Object): bool;
+extern macro TaggedNotEqual(Object, Object): bool;
 
 extern operator '+' macro SmiAdd(Smi, Smi): Smi;
 extern operator '-' macro SmiSub(Smi, Smi): Smi;
@@ -1726,6 +1750,8 @@ extern operator '!=' macro Word32NotEqual(bool, bool): bool;
 
 extern operator '+' macro Float64Add(float64, float64): float64;
 extern operator '-' macro Float64Sub(float64, float64): float64;
+extern operator '*' macro Float64Mul(float64, float64): float64;
+extern operator '/' macro Float64Div(float64, float64): float64;
 
 extern operator '+' macro NumberAdd(Number, Number): Number;
 extern operator '-' macro NumberSub(Number, Number): Number;
@@ -1839,6 +1865,12 @@ Cast<Number>(o: Object): Number
   return TaggedToNumber(o) otherwise CastError;
 }
 
+Cast<Undefined>(o: Object): Undefined
+    labels CastError {
+  if (o != Undefined) goto CastError;
+  return %RawDownCast<Undefined>(o);
+}
+
 macro Cast<A: type>(o: HeapObject): A
     labels CastError;
 
@@ -1851,6 +1883,12 @@ Cast<Null>(o: HeapObject): Null
     labels CastError {
   if (o != Null) goto CastError;
   return %RawDownCast<Null>(o);
+}
+
+Cast<Undefined>(o: HeapObject): Undefined
+    labels CastError {
+  const o: Object = o;
+  return Cast<Undefined>(o) otherwise CastError;
 }
 
 Cast<FixedArray>(o: HeapObject): FixedArray
@@ -2008,7 +2046,13 @@ Cast<JSArgumentsObjectWithLength>(implicit context: Context)(o: HeapObject):
 
 Cast<FastJSRegExp>(implicit context: Context)(o: HeapObject): FastJSRegExp
     labels CastError {
-  if (regexp::BranchIfFastRegExp(o)) return %RawDownCast<FastJSRegExp>(o);
+  // TODO(jgruber): Remove or redesign this. There is no single 'fast' regexp,
+  // the conditions to make a regexp object fast differ based on the callsite.
+  // For now, run the strict variant since replace (the only current callsite)
+  // accesses flag getters.
+  if (regexp::IsFastRegExpStrict(o)) {
+    return %RawDownCast<FastJSRegExp>(o);
+  }
   goto CastError;
 }
 
@@ -2378,20 +2422,9 @@ Convert<bint, Smi>(v: Smi): bint {
   return SmiToBInt(v);
 }
 
-macro BranchIf<A: type, B: type>(implicit context: Context)(o: B): never
-    labels True, False {
-  Cast<A>(o) otherwise False;
-  goto True;
-}
-
-macro BranchIfNot<A: type, B: type>(implicit context: Context)(o: B): never
-    labels True, False {
-  Cast<A>(o) otherwise True;
-  goto False;
-}
-
 macro Is<A: type, B: type>(implicit context: Context)(o: B): bool {
-  return (BranchIf<A, B>(o)) ? true : false;
+  Cast<A>(o) otherwise return false;
+  return true;
 }
 
 macro UnsafeCast<A: type>(implicit context: Context)(o: Object): A {
@@ -2472,6 +2505,8 @@ extern operator '.floats[]=' macro StoreFixedDoubleArrayElement(
     FixedDoubleArray, intptr, float64): void;
 extern operator '.floats[]=' macro StoreFixedDoubleArrayElementSmi(
     FixedDoubleArray, Smi, float64): void;
+extern operator '.floats[]' macro LoadFixedDoubleArrayElement(
+    FixedDoubleArray, intptr): float64;
 operator '[]=' macro StoreFixedDoubleArrayDirect(
     a: FixedDoubleArray, i: Smi, v: Number) {
   a.floats[i] = Convert<float64>(v);
@@ -2902,17 +2937,18 @@ macro NumberIsNaN(number: Number): bool {
 }
 
 extern macro GotoIfForceSlowPath() labels Taken;
+macro IsForceSlowPath(): bool {
+  GotoIfForceSlowPath() otherwise return true;
+  return false;
+}
+
 extern macro BranchIfToBooleanIsTrue(Object): never
     labels Taken, NotTaken;
 extern macro BranchIfToBooleanIsFalse(Object): never
     labels Taken, NotTaken;
 
 macro ToBoolean(obj: Object): bool {
-  if (BranchIfToBooleanIsTrue(obj)) {
-    return true;
-  } else {
-    return false;
-  }
+  BranchIfToBooleanIsTrue(obj) otherwise return true, return false;
 }
 
 @export
@@ -2925,6 +2961,9 @@ macro RequireObjectCoercible(implicit context: Context)(
 }
 
 extern macro BranchIfSameValue(Object, Object): never labels Taken, NotTaken;
+macro SameValue(a: Object, b: Object): bool {
+  BranchIfSameValue(a, b) otherwise return true, return false;
+}
 
 transitioning macro ToIndex(input: Object, context: Context): Number
     labels RangeError {
@@ -2970,10 +3009,8 @@ transitioning macro GetMethod(implicit context: Context)(
 
 extern macro NumberToString(Number): String;
 extern macro IsOneByteStringInstanceType(InstanceType): bool;
-extern macro AllocateSeqOneByteString(implicit context: Context)(uint32):
-    String;
-extern macro AllocateSeqTwoByteString(implicit context: Context)(uint32):
-    String;
+extern macro AllocateSeqOneByteString(uint32): String;
+extern macro AllocateSeqTwoByteString(uint32): String;
 extern macro ConvertToRelativeIndex(implicit context: Context)(
     Object, intptr): intptr;
 
@@ -2989,25 +3026,20 @@ struct KeyValuePair {
 // using "legacy" APIs. In Torque code, these should not be used.
 @export
 macro IsFastJSArray(o: Object, context: Context): bool {
-  try {
-    // Long-term, it's likely not a good idea to have this slow-path test here,
-    // since it fundamentally breaks the type system.
-    GotoIfForceSlowPath() otherwise ForceSlow;
-  }
-  label ForceSlow {
-    return false;
-  }
-
+  // Long-term, it's likely not a good idea to have this slow-path test here,
+  // since it fundamentally breaks the type system.
+  if (IsForceSlowPath()) return false;
   return Is<FastJSArray>(o);
 }
 
 @export
 macro BranchIfFastJSArray(o: Object, context: Context): never labels True,
     False {
-  // Long-term, it's likely not a good idea to have this slow-path test here,
-  // since it fundamentally breaks the type system.
-  GotoIfForceSlowPath() otherwise False;
-  BranchIf<FastJSArray>(o) otherwise True, False;
+  if (IsFastJSArray(o, context)) {
+    goto True;
+  } else {
+    goto False;
+  }
 }
 
 @export
@@ -3015,8 +3047,12 @@ macro BranchIfFastJSArrayForRead(o: Object, context: Context):
     never labels True, False {
   // Long-term, it's likely not a good idea to have this slow-path test here,
   // since it fundamentally breaks the type system.
-  GotoIfForceSlowPath() otherwise False;
-  BranchIf<FastJSArrayForRead>(o) otherwise True, False;
+  if (IsForceSlowPath()) goto False;
+  if (Is<FastJSArrayForRead>(o)) {
+    goto True;
+  } else {
+    goto False;
+  }
 }
 
 @export

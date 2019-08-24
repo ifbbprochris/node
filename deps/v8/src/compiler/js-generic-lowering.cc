@@ -9,10 +9,12 @@
 #include "src/codegen/code-factory.h"
 #include "src/compiler/common-operator.h"
 #include "src/compiler/js-graph.h"
+#include "src/compiler/js-heap-broker.h"
 #include "src/compiler/machine-operator.h"
 #include "src/compiler/node-matchers.h"
 #include "src/compiler/node-properties.h"
 #include "src/compiler/operator-properties.h"
+#include "src/compiler/processed-feedback.h"
 #include "src/objects/feedback-cell.h"
 #include "src/objects/feedback-vector.h"
 #include "src/objects/scope-info.h"
@@ -31,8 +33,9 @@ CallDescriptor::Flags FrameStateFlagForCall(Node* node) {
 
 }  // namespace
 
-JSGenericLowering::JSGenericLowering(JSGraph* jsgraph, Editor* editor)
-    : AdvancedReducer(editor), jsgraph_(jsgraph) {}
+JSGenericLowering::JSGenericLowering(JSGraph* jsgraph, Editor* editor,
+                                     JSHeapBroker* broker)
+    : AdvancedReducer(editor), jsgraph_(jsgraph), broker_(broker) {}
 
 JSGenericLowering::~JSGenericLowering() = default;
 
@@ -144,6 +147,26 @@ void JSGenericLowering::LowerJSStrictEqual(Node* node) {
                       Operator::kEliminatable);
 }
 
+namespace {
+bool ShouldUseMegamorphicLoadBuiltin(VectorSlotPair const& vector_slot_pair,
+                                     JSHeapBroker* broker) {
+  if (!FLAG_concurrent_inlining) {
+    return vector_slot_pair.ic_state() == MEGAMORPHIC;
+  }
+  ProcessedFeedback const& feedback =
+      broker->GetFeedback(FeedbackSource(vector_slot_pair));
+
+  if (feedback.kind() == ProcessedFeedback::kElementAccess) {
+    return feedback.AsElementAccess().transition_groups().empty();
+  } else if (feedback.kind() == ProcessedFeedback::kNamedAccess) {
+    return feedback.AsNamedAccess().maps().empty();
+  } else if (feedback.kind() == ProcessedFeedback::kInsufficient) {
+    return false;
+  }
+  UNREACHABLE();
+}
+}  // namespace
+
 void JSGenericLowering::LowerJSLoadProperty(Node* node) {
   CallDescriptor::Flags flags = FrameStateFlagForCall(node);
   const PropertyAccess& p = PropertyAccessOf(node->op());
@@ -152,13 +175,13 @@ void JSGenericLowering::LowerJSLoadProperty(Node* node) {
   node->InsertInput(zone(), 2, jsgraph()->SmiConstant(p.feedback().index()));
   if (outer_state->opcode() != IrOpcode::kFrameState) {
     Callable callable = Builtins::CallableFor(
-        isolate(), p.feedback().ic_state() == MEGAMORPHIC
+        isolate(), ShouldUseMegamorphicLoadBuiltin(p.feedback(), broker())
                        ? Builtins::kKeyedLoadICTrampoline_Megamorphic
                        : Builtins::kKeyedLoadICTrampoline);
     ReplaceWithStubCall(node, callable, flags);
   } else {
     Callable callable = Builtins::CallableFor(
-        isolate(), p.feedback().ic_state() == MEGAMORPHIC
+        isolate(), ShouldUseMegamorphicLoadBuiltin(p.feedback(), broker())
                        ? Builtins::kKeyedLoadIC_Megamorphic
                        : Builtins::kKeyedLoadIC);
     Node* vector = jsgraph()->HeapConstant(p.feedback().vector());
@@ -182,15 +205,15 @@ void JSGenericLowering::LowerJSLoadNamed(Node* node) {
   node->InsertInput(zone(), 2, jsgraph()->SmiConstant(p.feedback().index()));
   if (outer_state->opcode() != IrOpcode::kFrameState) {
     Callable callable = Builtins::CallableFor(
-        isolate(), p.feedback().ic_state() == MEGAMORPHIC
+        isolate(), ShouldUseMegamorphicLoadBuiltin(p.feedback(), broker())
                        ? Builtins::kLoadICTrampoline_Megamorphic
                        : Builtins::kLoadICTrampoline);
     ReplaceWithStubCall(node, callable, flags);
   } else {
-    Callable callable =
-        Builtins::CallableFor(isolate(), p.feedback().ic_state() == MEGAMORPHIC
-                                             ? Builtins::kLoadIC_Megamorphic
-                                             : Builtins::kLoadIC);
+    Callable callable = Builtins::CallableFor(
+        isolate(), ShouldUseMegamorphicLoadBuiltin(p.feedback(), broker())
+                       ? Builtins::kLoadIC_Megamorphic
+                       : Builtins::kLoadIC);
     Node* vector = jsgraph()->HeapConstant(p.feedback().vector());
     node->InsertInput(zone(), 3, vector);
     ReplaceWithStubCall(node, callable, flags);
@@ -214,6 +237,17 @@ void JSGenericLowering::LowerJSLoadGlobal(Node* node) {
     node->InsertInput(zone(), 2, vector);
     ReplaceWithStubCall(node, callable, flags);
   }
+}
+
+void JSGenericLowering::LowerJSGetIterator(Node* node) {
+  CallDescriptor::Flags flags = FrameStateFlagForCall(node);
+  const PropertyAccess& p = PropertyAccessOf(node->op());
+  node->InsertInput(zone(), 1, jsgraph()->SmiConstant(p.feedback().index()));
+  Node* vector = jsgraph()->HeapConstant(p.feedback().vector());
+  node->InsertInput(zone(), 2, vector);
+  Callable callable =
+      Builtins::CallableFor(isolate(), Builtins::kGetIteratorWithFeedback);
+  ReplaceWithStubCall(node, callable, flags);
 }
 
 void JSGenericLowering::LowerJSStoreProperty(Node* node) {
@@ -298,6 +332,7 @@ void JSGenericLowering::LowerJSStoreGlobal(Node* node) {
 
 void JSGenericLowering::LowerJSStoreDataPropertyInLiteral(Node* node) {
   FeedbackParameter const& p = FeedbackParameterOf(node->op());
+  RelaxControls(node);
   node->InsertInputs(zone(), 4, 2);
   node->ReplaceInput(4, jsgraph()->HeapConstant(p.feedback().vector()));
   node->ReplaceInput(5, jsgraph()->SmiConstant(p.feedback().index()));
@@ -812,14 +847,13 @@ void JSGenericLowering::LowerJSStackCheck(Node* node) {
   Node* effect = NodeProperties::GetEffectInput(node);
   Node* control = NodeProperties::GetControlInput(node);
 
-  Node* limit = effect = graph()->NewNode(
-      machine()->Load(MachineType::Pointer()),
-      jsgraph()->ExternalConstant(
-          ExternalReference::address_of_stack_limit(isolate())),
-      jsgraph()->IntPtrConstant(0), effect, control);
-  Node* pointer = graph()->NewNode(machine()->LoadStackPointer());
+  Node* limit = effect =
+      graph()->NewNode(machine()->Load(MachineType::Pointer()),
+                       jsgraph()->ExternalConstant(
+                           ExternalReference::address_of_jslimit(isolate())),
+                       jsgraph()->IntPtrConstant(0), effect, control);
 
-  Node* check = graph()->NewNode(machine()->UintLessThan(), limit, pointer);
+  Node* check = graph()->NewNode(machine()->StackPointerGreaterThan(), limit);
   Node* branch =
       graph()->NewNode(common()->Branch(BranchHint::kTrue), check, control);
 

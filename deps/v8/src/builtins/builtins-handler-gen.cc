@@ -66,9 +66,9 @@ void Builtins::Generate_KeyedStoreIC_Megamorphic(
   KeyedStoreGenericGenerator::Generate(state);
 }
 
-void Builtins::Generate_StoreIC_Uninitialized(
+void Builtins::Generate_StoreIC_NoFeedback(
     compiler::CodeAssemblerState* state) {
-  StoreICUninitializedGenerator::Generate(state);
+  StoreICNoFeedbackGenerator::Generate(state);
 }
 
 // TODO(mythria): Check if we can remove feedback vector and slot parameters in
@@ -403,7 +403,7 @@ TF_BUILTIN(LoadIC_FunctionPrototype, CodeStubAssembler) {
   Node* context = Parameter(Descriptor::kContext);
 
   Label miss(this, Label::kDeferred);
-  Return(LoadJSFunctionPrototype(receiver, &miss));
+  Return(LoadJSFunctionPrototype(CAST(receiver), &miss));
 
   BIND(&miss);
   TailCallRuntime(Runtime::kLoadIC_Miss, context, receiver, name, slot, vector);

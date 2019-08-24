@@ -270,10 +270,11 @@ size_t Heap::MinOldGenerationSize() {
 size_t Heap::MaxOldGenerationSize(uint64_t physical_memory) {
   size_t max_size = V8HeapTrait::kMaxSize;
   // Finch experiment: Increase the heap size from 2GB to 4GB for 64-bit
-  // systems with physical memory bigger than 16GB.
+  // systems with physical memory bigger than 16GB. The physical memory
+  // is rounded up to GB.
   constexpr bool x64_bit = Heap::kPointerMultiplier >= 2;
   if (FLAG_huge_max_old_generation_size && x64_bit &&
-      physical_memory / GB > 16) {
+      (physical_memory + 512 * MB) / GB >= 16) {
     DCHECK_EQ(max_size / GB, 2);
     max_size *= 2;
   }
@@ -1107,6 +1108,15 @@ void Heap::GarbageCollectionEpilogue() {
   AllowHeapAllocation for_the_rest_of_the_epilogue;
 
 #ifdef DEBUG
+  // Old-to-new slot sets must be empty after each collection.
+  for (SpaceIterator it(this); it.HasNext();) {
+    Space* space = it.Next();
+
+    for (MemoryChunk* chunk = space->first_page(); chunk != space->last_page();
+         chunk = chunk->list_node().next())
+      DCHECK_NULL(chunk->invalidated_slots<OLD_TO_NEW>());
+  }
+
   if (FLAG_print_global_handles) isolate_->global_handles()->Print();
   if (FLAG_print_handles) PrintHandles();
   if (FLAG_gc_verbose) Print();
@@ -1179,16 +1189,9 @@ void Heap::GarbageCollectionEpilogue() {
   }
 
   if (FLAG_harmony_weak_refs) {
-    // TODO(marja): (spec): The exact condition on when to schedule the cleanup
-    // task is unclear. This version schedules the cleanup task for a
-    // JSFinalizationGroup whenever the GC has discovered new dirty WeakCells
-    // for it (at that point it might have leftover dirty WeakCells since an
-    // earlier invocation of the cleanup function didn't iterate through
-    // them). See https://github.com/tc39/proposal-weakrefs/issues/34
     HandleScope handle_scope(isolate());
     while (!isolate()->heap()->dirty_js_finalization_groups().IsUndefined(
         isolate())) {
-      // Enqueue one microtask per JSFinalizationGroup.
       Handle<JSFinalizationGroup> finalization_group(
           JSFinalizationGroup::cast(
               isolate()->heap()->dirty_js_finalization_groups()),
@@ -1196,22 +1199,7 @@ void Heap::GarbageCollectionEpilogue() {
       isolate()->heap()->set_dirty_js_finalization_groups(
           finalization_group->next());
       finalization_group->set_next(ReadOnlyRoots(isolate()).undefined_value());
-      Handle<NativeContext> context(finalization_group->native_context(),
-                                    isolate());
-      // GC has no native context, but we use the creation context of the
-      // JSFinalizationGroup for the EnqueueTask operation. This is consitent
-      // with the Promise implementation, assuming the JSFinalizationGroup's
-      // creation context is the "caller's context" in promise functions. An
-      // alternative would be to use the native context of the cleanup
-      // function. This difference shouldn't be observable from JavaScript,
-      // since we enter the native context of the cleanup function before
-      // calling it. TODO(marja): Revisit when the spec clarifies this. See also
-      // https://github.com/tc39/proposal-weakrefs/issues/38 .
-      Handle<FinalizationGroupCleanupJobTask> task =
-          isolate()->factory()->NewFinalizationGroupCleanupJobTask(
-              finalization_group);
-      MicrotaskQueue* microtask_queue = context->microtask_queue();
-      if (microtask_queue) microtask_queue->EnqueueMicrotask(*task);
+      isolate()->RunHostCleanupFinalizationGroupCallback(finalization_group);
     }
   }
 }
@@ -2944,6 +2932,9 @@ void Heap::OnMoveEvent(HeapObject target, HeapObject source,
   if (target.IsSharedFunctionInfo()) {
     LOG_CODE_EVENT(isolate_, SharedFunctionInfoMoveEvent(source.address(),
                                                          target.address()));
+  } else if (target.IsNativeContext()) {
+    PROFILE(isolate_,
+            NativeContextMoveEvent(source.address(), target.address()));
   }
 
   if (FLAG_verify_predictable) {
@@ -3016,10 +3007,12 @@ FixedArrayBase Heap::LeftTrimFixedArray(FixedArrayBase object,
   FixedArrayBase new_object =
       FixedArrayBase::cast(HeapObject::FromAddress(new_start));
 
-  // Remove recorded slots for the new map and length offset.
-  ClearRecordedSlot(new_object, new_object.RawField(0));
-  ClearRecordedSlot(new_object,
-                    new_object.RawField(FixedArrayBase::kLengthOffset));
+#ifdef DEBUG
+  if (MayContainRecordedSlots(object)) {
+    MemoryChunk* chunk = MemoryChunk::FromHeapObject(object);
+    DCHECK(!chunk->RegisteredObjectWithInvalidatedSlots<OLD_TO_NEW>(object));
+  }
+#endif
 
   // Handle invalidated old-to-old slots.
   if (incremental_marking()->IsCompacting() &&
@@ -3027,7 +3020,7 @@ FixedArrayBase Heap::LeftTrimFixedArray(FixedArrayBase object,
     // If the array was right-trimmed before, then it is registered in
     // the invalidated_slots.
     MemoryChunk::FromHeapObject(new_object)
-        ->MoveObjectWithInvalidatedSlots(filler, new_object);
+        ->MoveObjectWithInvalidatedSlots<OLD_TO_OLD>(filler, new_object);
     // We have to clear slots in the free space to avoid stale old-to-old slots.
     // Note we cannot use ClearFreedMemoryMode of CreateFillerObjectAt because
     // we need pointer granularity writes to avoid race with the concurrent
@@ -3106,6 +3099,13 @@ void Heap::CreateFillerForArray(T object, int elements_to_trim,
   Address old_end = object.address() + old_size;
   Address new_end = old_end - bytes_to_trim;
 
+#ifdef DEBUG
+  if (MayContainRecordedSlots(object)) {
+    MemoryChunk* chunk = MemoryChunk::FromHeapObject(object);
+    DCHECK(!chunk->RegisteredObjectWithInvalidatedSlots<OLD_TO_NEW>(object));
+  }
+#endif
+
   // Register the array as an object with invalidated old-to-old slots. We
   // cannot use NotifyObjectLayoutChange as it would mark the array black,
   // which is not safe for left-trimming because left-trimming re-pushes
@@ -3115,8 +3115,8 @@ void Heap::CreateFillerForArray(T object, int elements_to_trim,
     // Ensure that the object survives because the InvalidatedSlotsFilter will
     // compute its size from its map during pointers updating phase.
     incremental_marking()->WhiteToGreyAndPush(object);
-    MemoryChunk::FromHeapObject(object)->RegisterObjectWithInvalidatedSlots(
-        object, old_size);
+    MemoryChunk* chunk = MemoryChunk::FromHeapObject(object);
+    chunk->RegisterObjectWithInvalidatedSlots<OLD_TO_OLD>(object, old_size);
   }
 
   // Technically in new space this write might be omitted (except for
@@ -3408,9 +3408,13 @@ void Heap::NotifyObjectLayoutChange(HeapObject object, int size,
     incremental_marking()->MarkBlackAndVisitObjectDueToLayoutChange(object);
     if (incremental_marking()->IsCompacting() &&
         MayContainRecordedSlots(object)) {
-      MemoryChunk::FromHeapObject(object)->RegisterObjectWithInvalidatedSlots(
-          object, size);
+      MemoryChunk::FromHeapObject(object)
+          ->RegisterObjectWithInvalidatedSlots<OLD_TO_OLD>(object, size);
     }
+  }
+  if (MayContainRecordedSlots(object)) {
+    MemoryChunk::FromHeapObject(object)
+        ->RegisterObjectWithInvalidatedSlots<OLD_TO_NEW>(object, size);
   }
 #ifdef VERIFY_HEAP
   if (FLAG_verify_heap) {
@@ -4451,6 +4455,7 @@ void Heap::ConfigureHeap(const v8::ResourceConstraints& constraints) {
         static_cast<size_t>(base::bits::RoundUpToPowerOfTwo64(
             static_cast<uint64_t>(max_semi_space_size_)));
     max_semi_space_size_ = Max(max_semi_space_size_, kMinSemiSpaceSize);
+    max_semi_space_size_ = Min(max_semi_space_size_, kMaxSemiSpaceSize);
     max_semi_space_size_ = RoundDown<Page::kPageSize>(max_semi_space_size_);
   }
 
@@ -4495,6 +4500,14 @@ void Heap::ConfigureHeap(const v8::ResourceConstraints& constraints) {
       initial_semispace_size_ = SemiSpaceSizeFromYoungGenerationSize(
           constraints.initial_young_generation_size_in_bytes());
     }
+    if (FLAG_initial_heap_size > 0) {
+      size_t young_generation, old_generation;
+      Heap::GenerationSizesFromHeapSize(
+          static_cast<size_t>(FLAG_initial_heap_size) * MB, &young_generation,
+          &old_generation);
+      initial_semispace_size_ =
+          SemiSpaceSizeFromYoungGenerationSize(young_generation);
+    }
     if (FLAG_min_semi_space_size > 0) {
       initial_semispace_size_ =
           static_cast<size_t>(FLAG_min_semi_space_size) * MB;
@@ -4511,6 +4524,17 @@ void Heap::ConfigureHeap(const v8::ResourceConstraints& constraints) {
     if (constraints.initial_old_generation_size_in_bytes() > 0) {
       initial_old_generation_size_ =
           constraints.initial_old_generation_size_in_bytes();
+      old_generation_size_configured_ = true;
+    }
+    if (FLAG_initial_heap_size > 0) {
+      size_t initial_heap_size =
+          static_cast<size_t>(FLAG_initial_heap_size) * MB;
+      size_t young_generation_size =
+          YoungGenerationSizeFromSemiSpaceSize(initial_semispace_size_);
+      initial_old_generation_size_ =
+          initial_heap_size > young_generation_size
+              ? initial_heap_size - young_generation_size
+              : 0;
       old_generation_size_configured_ = true;
     }
     if (FLAG_initial_old_space_size > 0) {
@@ -4875,9 +4899,10 @@ HeapObject Heap::EnsureImmovableCode(HeapObject heap_object, int object_size) {
 }
 
 HeapObject Heap::AllocateRawWithLightRetry(int size, AllocationType allocation,
+                                           AllocationOrigin origin,
                                            AllocationAlignment alignment) {
   HeapObject result;
-  AllocationResult alloc = AllocateRaw(size, allocation, alignment);
+  AllocationResult alloc = AllocateRaw(size, allocation, origin, alignment);
   if (alloc.To(&result)) {
     DCHECK(result != ReadOnlyRoots(this).exception());
     return result;
@@ -4886,7 +4911,7 @@ HeapObject Heap::AllocateRawWithLightRetry(int size, AllocationType allocation,
   for (int i = 0; i < 2; i++) {
     CollectGarbage(alloc.RetrySpace(),
                    GarbageCollectionReason::kAllocationFailure);
-    alloc = AllocateRaw(size, allocation, alignment);
+    alloc = AllocateRaw(size, allocation, origin, alignment);
     if (alloc.To(&result)) {
       DCHECK(result != ReadOnlyRoots(this).exception());
       return result;
@@ -4896,16 +4921,18 @@ HeapObject Heap::AllocateRawWithLightRetry(int size, AllocationType allocation,
 }
 
 HeapObject Heap::AllocateRawWithRetryOrFail(int size, AllocationType allocation,
+                                            AllocationOrigin origin,
                                             AllocationAlignment alignment) {
   AllocationResult alloc;
-  HeapObject result = AllocateRawWithLightRetry(size, allocation, alignment);
+  HeapObject result =
+      AllocateRawWithLightRetry(size, allocation, origin, alignment);
   if (!result.is_null()) return result;
 
   isolate()->counters()->gc_last_resort_from_handles()->Increment();
   CollectAllAvailableGarbage(GarbageCollectionReason::kLastResort);
   {
     AlwaysAllocateScope scope(isolate());
-    alloc = AllocateRaw(size, allocation, alignment);
+    alloc = AllocateRaw(size, allocation, origin, alignment);
   }
   if (alloc.To(&result)) {
     DCHECK(result != ReadOnlyRoots(this).exception());
@@ -5085,25 +5112,6 @@ void Heap::InitializeHashSeed() {
   }
   ReadOnlyRoots(this).hash_seed().copy_in(
       0, reinterpret_cast<byte*>(&new_hash_seed), kInt64Size);
-}
-
-void Heap::SetStackLimits() {
-  DCHECK_NOT_NULL(isolate_);
-  DCHECK(isolate_ == isolate());
-  // On 64 bit machines, pointers are generally out of range of Smis.  We write
-  // something that looks like an out of range Smi to the GC.
-
-  // Set up the special root array entries containing the stack limits.
-  // These are actually addresses, but the tag makes the GC ignore it.
-  roots_table()[RootIndex::kStackLimit] =
-      (isolate_->stack_guard()->jslimit() & ~kSmiTagMask) | kSmiTag;
-  roots_table()[RootIndex::kRealStackLimit] =
-      (isolate_->stack_guard()->real_jslimit() & ~kSmiTagMask) | kSmiTag;
-}
-
-void Heap::ClearStackLimits() {
-  roots_table()[RootIndex::kStackLimit] = kNullAddress;
-  roots_table()[RootIndex::kRealStackLimit] = kNullAddress;
 }
 
 int Heap::NextAllocationTimeout(int current_timeout) {
@@ -5541,7 +5549,8 @@ void Heap::ClearRecordedSlot(HeapObject object, ObjectSlot slot) {
   Page* page = Page::FromAddress(slot.address());
   if (!page->InYoungGeneration()) {
     DCHECK_EQ(page->owner_identity(), OLD_SPACE);
-    store_buffer()->DeleteEntry(slot.address());
+    store_buffer()->MoveAllEntriesToRememberedSet();
+    RememberedSet<OLD_TO_NEW>::Remove(page, slot.address());
   }
 }
 
@@ -5555,7 +5564,7 @@ void Heap::VerifyClearedSlot(HeapObject object, ObjectSlot slot) {
   CHECK(!RememberedSet<OLD_TO_NEW>::Contains(page, slot.address()));
   // Old to old slots are filtered with invalidated slots.
   CHECK_IMPLIES(RememberedSet<OLD_TO_OLD>::Contains(page, slot.address()),
-                page->RegisteredObjectWithInvalidatedSlots(object));
+                page->RegisteredObjectWithInvalidatedSlots<OLD_TO_OLD>(object));
 }
 #endif
 
@@ -5564,7 +5573,9 @@ void Heap::ClearRecordedSlotRange(Address start, Address end) {
   DCHECK(!page->IsLargePage());
   if (!page->InYoungGeneration()) {
     DCHECK_EQ(page->owner_identity(), OLD_SPACE);
-    store_buffer()->DeleteEntry(start, end);
+    store_buffer()->MoveAllEntriesToRememberedSet();
+    RememberedSet<OLD_TO_NEW>::RemoveRange(page, start, end,
+                                           SlotSet::KEEP_EMPTY_BUCKETS);
   }
 }
 

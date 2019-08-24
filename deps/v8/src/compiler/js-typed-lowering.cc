@@ -1320,7 +1320,7 @@ Reduction JSTypedLowering::ReduceJSLoadContext(Node* node) {
   for (size_t i = 0; i < access.depth(); ++i) {
     context = effect = graph()->NewNode(
         simplified()->LoadField(
-            AccessBuilder::ForContextSlot(Context::PREVIOUS_INDEX)),
+            AccessBuilder::ForContextSlotKnownPointer(Context::PREVIOUS_INDEX)),
         context, effect, control);
   }
   node->ReplaceInput(0, context);
@@ -1342,7 +1342,7 @@ Reduction JSTypedLowering::ReduceJSStoreContext(Node* node) {
   for (size_t i = 0; i < access.depth(); ++i) {
     context = effect = graph()->NewNode(
         simplified()->LoadField(
-            AccessBuilder::ForContextSlot(Context::PREVIOUS_INDEX)),
+            AccessBuilder::ForContextSlotKnownPointer(Context::PREVIOUS_INDEX)),
         context, effect, control);
   }
   node->ReplaceInput(0, context);
@@ -1367,8 +1367,8 @@ Node* JSTypedLowering::BuildGetModuleCell(Node* node) {
   if (module_type.IsHeapConstant()) {
     SourceTextModuleRef module_constant =
         module_type.AsHeapConstant()->Ref().AsSourceTextModule();
-    CellRef cell_constant = module_constant.GetCell(cell_index);
-    return jsgraph()->Constant(cell_constant);
+    base::Optional<CellRef> cell_constant = module_constant.GetCell(cell_index);
+    if (cell_constant.has_value()) return jsgraph()->Constant(*cell_constant);
   }
 
   FieldAccess field_access;

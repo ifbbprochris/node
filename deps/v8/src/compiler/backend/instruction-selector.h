@@ -446,7 +446,8 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
 
   // Check if we can generate loads and stores of ExternalConstants relative
   // to the roots register.
-  bool CanAddressRelativeToRootsRegister() const;
+  bool CanAddressRelativeToRootsRegister(
+      const ExternalReference& reference) const;
   // Check if we can use the roots register to access GC roots.
   bool CanUseRootsRegister() const;
 
@@ -543,7 +544,7 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
   void MarkAsSimd128(Node* node) {
     MarkAsRepresentation(MachineRepresentation::kSimd128, node);
   }
-  void MarkAsReference(Node* node) {
+  void MarkAsTagged(Node* node) {
     MarkAsRepresentation(MachineRepresentation::kTagged, node);
   }
   void MarkAsCompressed(Node* node) {
@@ -621,8 +622,6 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
   void VisitProjection(Node* node);
   void VisitConstant(Node* node);
   void VisitCall(Node* call, BasicBlock* handler = nullptr);
-  void VisitCallWithCallerSavedRegisters(Node* call,
-                                         BasicBlock* handler = nullptr);
   void VisitDeoptimizeIf(Node* node);
   void VisitDeoptimizeUnless(Node* node);
   void VisitTrapIf(Node* node, TrapId trap_id);
@@ -639,6 +638,8 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
   void VisitUnreachable(Node* node);
   void VisitStaticAssert(Node* node);
   void VisitDeadValue(Node* node);
+
+  void VisitStackPointerGreaterThan(Node* node, FlagsContinuation* cont);
 
   void VisitWordCompareZero(Node* user, Node* value, FlagsContinuation* cont);
 
@@ -782,6 +783,10 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
   ZoneVector<std::pair<int, int>> instr_origins_;
   EnableTraceTurboJson trace_turbo_;
   TickCounter* const tick_counter_;
+
+  // Store the maximal unoptimized frame height. Later used to apply an offset
+  // to stack checks.
+  size_t max_unoptimized_frame_height_ = 0;
 };
 
 }  // namespace compiler
